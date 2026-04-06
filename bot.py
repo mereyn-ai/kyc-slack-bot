@@ -21,10 +21,6 @@ FUZZY_THRESHOLD  = 0.72
 # ── Sumsub API ─────────────────────────────────────────────────────────────────
 
 def sumsub_headers(method, path, body=b""):
-    """
-    Генерирует заголовки с подписью HMAC SHA256.
-    Важно: path должен включать query-параметры (например, ?limit=100).
-    """
     ts  = str(int(time.time()))
     msg = (ts + method.upper() + path).encode() + body
     sig = hmac.new(SUMSUB_SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()
@@ -36,15 +32,11 @@ def sumsub_headers(method, path, body=b""):
     }
 
 def sumsub_get(path, params=None):
-    """
-    Выполняет GET запрос. Использует requests.Request для корректного 
-    вычисления пути с параметрами для подписи.
-    """
     url = SUMSUB_BASE_URL + path
     req = requests.Request("GET", url, params=params)
     prepared = req.prepare()
     
-    # prepared.path_url содержит путь + query string (напр. /resources/applicants/-/main?limit=100)
+    # Sign using the path + query string (e.g. /resources/applicants?limit=100)
     headers = sumsub_headers("GET", prepared.path_url)
     prepared.headers.update(headers)
 
@@ -52,20 +44,18 @@ def sumsub_get(path, params=None):
         resp = s.send(prepared, timeout=30)
     
     if resp.status_code != 200:
-        print(f"DEBUG: Error from Sumsub: {resp.text}")
+        print(f"DEBUG: Sumsub API Error {resp.status_code}: {resp.text}")
         
     resp.raise_for_status()
     return resp.json()
 
 def get_all_applicants():
-    """
-    Основной метод получения списка через /-/main.
-    """
     applicants = []
     offset, limit = 0, 100
 
     while True:
-        path = "/resources/applicants/-/main"
+        # Changed to the standard resources/applicants endpoint
+        path = "/resources/applicants"
         params = {
             "limit": limit,
             "offset": offset,
@@ -74,15 +64,29 @@ def get_all_applicants():
 
         try:
             data  = sumsub_get(path, params=params)
-            items = data.get("list", {}).get("items", [])
+            # Standard Sumsub search response is a list or contains a 'list' object
+            items = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("list", {}).get("items", data.get("items", []))
+
             if not items:
                 break
             
             applicants.extend(items)
-            total = data.get("list", {}).get("totalCount", 0)
+            
+            # Pagination logic
+            total = 0
+            if isinstance(data, dict):
+                total = data.get("list", {}).get("totalCount", data.get("total", 0))
+            
             offset += limit
-            if offset >= total:
+            if total > 0 and offset >= total:
                 break
+            if len(items) < limit: # Safety break if we get less than a full page
+                break
+                
         except Exception as e:
             print(f"    Ошибка при загрузке списка: {e}")
             break
@@ -185,19 +189,23 @@ def get_slack_users():
     return users
 
 def get_channel_id(name):
-    name, cursor = name.lstrip("#"), None
+    clean_name = name.lstrip("#").lower()
+    cursor = None
     while True:
-        params = {"limit": 200, "types": "public_channel,private_channel"}
+        # types MUST include public and private for the bot to see them
+        params = {"limit": 1000, "types": "public_channel,private_channel"}
         if cursor:
             params["cursor"] = cursor
         data = slack_get("conversations.list", params=params)
         for ch in data.get("channels", []):
-            if ch.get("name") == name:
+            if ch.get("name").lower() == clean_name:
                 return ch["id"]
+        
         cursor = data.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             break
-    raise RuntimeError(f"Канал #{name} не найден. Добавь бота в канал!")
+            
+    raise RuntimeError(f"Канал #{name} не найден. Убедись, что: 1. Имя верное. 2. БОТ ДОБАВЛЕН В КАНАЛ (/invite @bot).")
 
 # ── Name matching ──────────────────────────────────────────────────────────────
 
@@ -286,7 +294,7 @@ def main():
     alerts = []
     for app in applicants:
         try:
-            # Сначала проверяем, есть ли данные уже в объекте списка
+            # Optimize: use data from list if available
             if "info" in app and app["info"].get("idDocs"):
                 detail = app
             else:
@@ -298,7 +306,7 @@ def main():
                 flag = "🔴" if result["expired"] else "🟡"
                 print(f"    {flag} {result['full_name']} — {result['doc_type']} — {result['expiry_date']}")
         except Exception as e:
-            print(f"    ⚠️  Ошибка {app.get('id')}: {e}")
+            print(f"    ⚠️  Ошибка для ID {app.get('id')}: {e}")
             continue
 
     print(f"4/4 Отправляем в #{SLACK_CHANNEL}... ({len(alerts)} записей)")
