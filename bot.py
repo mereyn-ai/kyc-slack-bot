@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import hmac
 import hashlib
@@ -8,15 +9,22 @@ from difflib import SequenceMatcher
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-SUMSUB_APP_TOKEN  = os.environ["SUMSUB_APP_TOKEN"]
-SUMSUB_SECRET_KEY = os.environ["SUMSUB_SECRET_KEY"]
-SUMSUB_BASE_URL   = "https://api.sumsub.com"
+SUMSUB_APP_TOKEN  = os.environ.get("SUMSUB_APP_TOKEN")
+SUMSUB_SECRET_KEY = os.environ.get("SUMSUB_SECRET_KEY")
+SLACK_BOT_TOKEN   = os.environ.get("SLACK_BOT_TOKEN")
 
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "kyc-alerts")
+if not all([SUMSUB_APP_TOKEN, SUMSUB_SECRET_KEY, SLACK_BOT_TOKEN]):
+    print("CRITICAL: Missing required environment variables (SUMSUB_APP_TOKEN, SUMSUB_SECRET_KEY, SLACK_BOT_TOKEN).")
+    sys.exit(1)
+
+SUMSUB_BASE_URL   = "https://api.sumsub.com"
+SLACK_CHANNEL     = os.environ.get("SLACK_CHANNEL", "kyc-alerts")
 
 EXPIRY_WARN_DAYS = 30
 FUZZY_THRESHOLD  = 0.72
+
+# Reusable session to prevent opening/closing TCP connections on every request
+sumsub_session = requests.Session()
 
 # ── Sumsub API ─────────────────────────────────────────────────────────────────
 
@@ -39,8 +47,7 @@ def sumsub_get(path, params=None):
     headers = sumsub_headers("GET", prepared.path_url)
     prepared.headers.update(headers)
 
-    with requests.Session() as s:
-        resp = s.send(prepared, timeout=30)
+    resp = sumsub_session.send(prepared, timeout=30)
     
     if resp.status_code != 200:
         print(f"DEBUG: Sumsub API Error {resp.status_code}: {resp.text}")
@@ -134,37 +141,4 @@ def check_expiry(applicant):
 
 # ── Slack API ──────────────────────────────────────────────────────────────────
 
-def slack_get(method, params=None):
-    resp = requests.get(
-        f"https://slack.com/api/{method}",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        params=params,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Slack error [{method}]: {data.get('error')}")
-    return data
-
-def slack_post(method, payload):
-    resp = requests.post(
-        f"https://slack.com/api/{method}",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Slack error [{method}]: {data.get('error')}")
-    return data
-
-def get_slack_users():
-    users, cursor = [], None
-    while True:
-        params = {"limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        data = slack_get("users.list", params=params)
-        users.
+def slack_get(method,
