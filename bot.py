@@ -42,16 +42,77 @@ def sumsub_get(path, params=None):
     return resp.json()
 
 def get_all_applicants():
+    """
+    Получает список applicants через поиск.
+    Sumsub не имеет эндпоинта для получения всех applicants сразу,
+    поэтому используем поиск с пагинацией.
+    """
     applicants = []
     offset, limit = 0, 100
+
     while True:
-        data  = sumsub_get("/resources/applicants/-/list", params={"limit": limit, "offset": offset})
-        items = data.get("list", {}).get("items", [])
+        # Используем правильный эндпоинт для поиска applicants
+        path = "/resources/applicants/-/list"
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "reviewStatus": "completed",  # только завершённые KYC
+        }
+
+        try:
+            data  = sumsub_get(path, params=params)
+            items = data.get("list", {}).get("items", [])
+            if not items:
+                break
+            applicants.extend(items)
+            total = data.get("list", {}).get("totalCount", 0)
+            offset += limit
+            if offset >= total:
+                break
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                # Пробуем альтернативный эндпоинт
+                print(f"    Пробуем альтернативный эндпоинт...")
+                break
+            raise
+
+    return applicants
+
+def search_applicants_by_status():
+    """
+    Альтернативный способ — получаем applicants через search API.
+    """
+    applicants = []
+    offset, limit = 0, 100
+
+    while True:
+        path = "/resources/applicants"
+        params = {
+            "limit": limit,
+            "offset": offset,
+        }
+
+        data  = sumsub_get(path, params=params)
+
+        # Sumsub возвращает данные в разных форматах
+        if "list" in data:
+            items = data["list"].get("items", [])
+            total = data["list"].get("totalCount", 0)
+        elif "items" in data:
+            items = data["items"]
+            total = data.get("total", len(items))
+        else:
+            items = [data] if data.get("id") else []
+            total = len(items)
+
+        if not items:
+            break
+
         applicants.extend(items)
-        total = data.get("list", {}).get("totalCount", 0)
         offset += limit
         if offset >= total:
             break
+
     return applicants
 
 def get_applicant_detail(applicant_id):
@@ -245,6 +306,9 @@ def main():
 
     print("2/4 Загружаем applicants из Sumsub...")
     applicants = get_all_applicants()
+    if not applicants:
+        print("    Список пустой, пробуем альтернативный метод...")
+        applicants = search_applicants_by_status()
     print(f"    Найдено: {len(applicants)}")
 
     print("3/4 Проверяем документы...")
