@@ -36,7 +36,6 @@ def sumsub_get(path, params=None):
     req = requests.Request("GET", url, params=params)
     prepared = req.prepare()
     
-    # Path with query string is required for valid signature
     headers = sumsub_headers("GET", prepared.path_url)
     prepared.headers.update(headers)
 
@@ -54,7 +53,6 @@ def get_all_applicants():
     offset, limit = 0, 100
 
     while True:
-        # Mandatory suffix for filtered list searches
         path = "/resources/applicants/-/main"
         params = {
             "limit": limit,
@@ -127,4 +125,46 @@ def check_expiry(applicant):
     return {
         "applicant_id": applicant.get("id"),
         "full_name":    full_name,
-        "doc_type":      worst_doc.get("idDocType", "UNKNOWN")
+        "doc_type":      worst_doc.get("idDocType", "UNKNOWN") if worst_doc else "UNKNOWN",
+        "doc_number":    worst_doc.get("number", "—") if worst_doc else "—",
+        "expiry_date":  worst_expiry.strftime("%d.%m.%Y"),
+        "days_left":     days_left,
+        "expired":       days_left < 0,
+    }
+
+# ── Slack API ──────────────────────────────────────────────────────────────────
+
+def slack_get(method, params=None):
+    resp = requests.get(
+        f"https://slack.com/api/{method}",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        params=params,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack error [{method}]: {data.get('error')}")
+    return data
+
+def slack_post(method, payload):
+    resp = requests.post(
+        f"https://slack.com/api/{method}",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack error [{method}]: {data.get('error')}")
+    return data
+
+def get_slack_users():
+    users, cursor = [], None
+    while True:
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        data = slack_get("users.list", params=params)
+        users.
