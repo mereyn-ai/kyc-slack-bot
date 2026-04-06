@@ -45,7 +45,7 @@ def get_all_applicants():
     applicants = []
     offset, limit = 0, 100
     while True:
-        data  = sumsub_get("/resources/applicants", params={"limit": limit, "offset": offset})
+        data  = sumsub_get("/resources/applicants/-/list", params={"limit": limit, "offset": offset})
         items = data.get("list", {}).get("items", [])
         applicants.extend(items)
         total = data.get("list", {}).get("totalCount", 0)
