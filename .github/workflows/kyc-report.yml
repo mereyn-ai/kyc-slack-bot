@@ -1,0 +1,29 @@
+name: KYC Expiry Report
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 09:00 Ташкент (UTC+3)
+    - cron: '0 10 * * *'  # 13:00 Ташкент
+    - cron: '0 15 * * *'  # 18:00 Ташкент
+  workflow_dispatch:       # кнопка ручного запуска в GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run KYC bot
+        env:
+          SUMSUB_APP_TOKEN:  ${{ secrets.SUMSUB_APP_TOKEN }}
+          SUMSUB_SECRET_KEY: ${{ secrets.SUMSUB_SECRET_KEY }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL:     ${{ secrets.SLACK_CHANNEL }}
+        run: python bot.py
