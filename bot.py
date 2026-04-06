@@ -21,6 +21,10 @@ FUZZY_THRESHOLD  = 0.72
 # ── Sumsub API ─────────────────────────────────────────────────────────────────
 
 def sumsub_headers(method, path, body=b""):
+    """
+    Генерирует заголовки с подписью HMAC SHA256.
+    Важно: path должен включать query-параметры (например, ?limit=100).
+    """
     ts  = str(int(time.time()))
     msg = (ts + method.upper() + path).encode() + body
     sig = hmac.new(SUMSUB_SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()
@@ -32,31 +36,40 @@ def sumsub_headers(method, path, body=b""):
     }
 
 def sumsub_get(path, params=None):
-    resp = requests.get(
-        SUMSUB_BASE_URL + path,
-        headers=sumsub_headers("GET", path),
-        params=params,
-        timeout=30,
-    )
+    """
+    Выполняет GET запрос. Использует requests.Request для корректного 
+    вычисления пути с параметрами для подписи.
+    """
+    url = SUMSUB_BASE_URL + path
+    req = requests.Request("GET", url, params=params)
+    prepared = req.prepare()
+    
+    # prepared.path_url содержит путь + query string (напр. /resources/applicants/-/main?limit=100)
+    headers = sumsub_headers("GET", prepared.path_url)
+    prepared.headers.update(headers)
+
+    with requests.Session() as s:
+        resp = s.send(prepared, timeout=30)
+    
+    if resp.status_code != 200:
+        print(f"DEBUG: Error from Sumsub: {resp.text}")
+        
     resp.raise_for_status()
     return resp.json()
 
 def get_all_applicants():
     """
-    Получает список applicants через поиск.
-    Sumsub не имеет эндпоинта для получения всех applicants сразу,
-    поэтому используем поиск с пагинацией.
+    Основной метод получения списка через /-/main.
     """
     applicants = []
     offset, limit = 0, 100
 
     while True:
-        # Используем правильный эндпоинт для поиска applicants
-        path = "/resources/applicants/-/list"
+        path = "/resources/applicants/-/main"
         params = {
             "limit": limit,
             "offset": offset,
-            "reviewStatus": "completed",  # только завершённые KYC
+            "reviewStatus": "completed",
         }
 
         try:
@@ -64,53 +77,14 @@ def get_all_applicants():
             items = data.get("list", {}).get("items", [])
             if not items:
                 break
+            
             applicants.extend(items)
             total = data.get("list", {}).get("totalCount", 0)
             offset += limit
             if offset >= total:
                 break
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                # Пробуем альтернативный эндпоинт
-                print(f"    Пробуем альтернативный эндпоинт...")
-                break
-            raise
-
-    return applicants
-
-def search_applicants_by_status():
-    """
-    Альтернативный способ — получаем applicants через search API.
-    """
-    applicants = []
-    offset, limit = 0, 100
-
-    while True:
-        path = "/resources/applicants"
-        params = {
-            "limit": limit,
-            "offset": offset,
-        }
-
-        data  = sumsub_get(path, params=params)
-
-        # Sumsub возвращает данные в разных форматах
-        if "list" in data:
-            items = data["list"].get("items", [])
-            total = data["list"].get("totalCount", 0)
-        elif "items" in data:
-            items = data["items"]
-            total = data.get("total", len(items))
-        else:
-            items = [data] if data.get("id") else []
-            total = len(items)
-
-        if not items:
-            break
-
-        applicants.extend(items)
-        offset += limit
-        if offset >= total:
+        except Exception as e:
+            print(f"    Ошибка при загрузке списка: {e}")
             break
 
     return applicants
@@ -159,11 +133,11 @@ def check_expiry(applicant):
     return {
         "applicant_id": applicant.get("id"),
         "full_name":    full_name,
-        "doc_type":     worst_doc.get("idDocType", "UNKNOWN") if worst_doc else "UNKNOWN",
-        "doc_number":   worst_doc.get("number", "—") if worst_doc else "—",
+        "doc_type":      worst_doc.get("idDocType", "UNKNOWN") if worst_doc else "UNKNOWN",
+        "doc_number":    worst_doc.get("number", "—") if worst_doc else "—",
         "expiry_date":  worst_expiry.strftime("%d.%m.%Y"),
-        "days_left":    days_left,
-        "expired":      days_left < 0,
+        "days_left":     days_left,
+        "expired":       days_left < 0,
     }
 
 # ── Slack API ──────────────────────────────────────────────────────────────────
@@ -270,7 +244,7 @@ def post_report(alerts, slack_users):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "🛂 KYC Document Expiry Report", "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": (
-            f"📅 {now_str}  |  🔴 Истекло: *{len(expired)}*  |  🟡 Скоро: *{len(expiring)}*"
+            f"📅 {now_str}  |  🔴 Истекло: *{len(expired)}* |  🟡 Скоро: *{len(expiring)}*"
         )}]},
         {"type": "divider"},
     ]
@@ -306,16 +280,18 @@ def main():
 
     print("2/4 Загружаем applicants из Sumsub...")
     applicants = get_all_applicants()
-    if not applicants:
-        print("    Список пустой, пробуем альтернативный метод...")
-        applicants = search_applicants_by_status()
     print(f"    Найдено: {len(applicants)}")
 
     print("3/4 Проверяем документы...")
     alerts = []
     for app in applicants:
         try:
-            detail = get_applicant_detail(app["id"])
+            # Сначала проверяем, есть ли данные уже в объекте списка
+            if "info" in app and app["info"].get("idDocs"):
+                detail = app
+            else:
+                detail = get_applicant_detail(app["id"])
+                
             result = check_expiry(detail)
             if result:
                 alerts.append(result)
