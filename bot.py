@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import time
 import hmac
 import hashlib
@@ -19,6 +20,8 @@ if not all([SUMSUB_APP_TOKEN, SUMSUB_SECRET_KEY, SLACK_BOT_TOKEN]):
 
 SUMSUB_BASE_URL  = "https://api.sumsub.com"
 SLACK_CHANNEL    = os.environ.get("SLACK_CHANNEL", "kyc-alerts")
+CSV_FILE         = os.environ.get("CSV_FILE", "applicants.csv")
+
 EXPIRY_WARN_DAYS = 30
 FUZZY_THRESHOLD  = 0.72
 
@@ -42,32 +45,44 @@ def sumsub_get(path, params=None):
         params=params,
         timeout=30,
     )
-    if resp.status_code != 200:
-        print(f"    DEBUG Sumsub {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
-def get_all_applicants():
-    applicants = []
-    offset, limit = 0, 100
-    while True:
-        try:
-            data  = sumsub_get("/resources/applicants/-/main", params={"limit": limit, "offset": offset})
-            items = data.get("list", {}).get("items", [])
-            if not items:
-                break
-            applicants.extend(items)
-            total = data.get("list", {}).get("totalCount", 0)
-            offset += limit
-            if offset >= total:
-                break
-        except Exception as e:
-            print(f"    Ошибка загрузки: {e}")
-            break
-    return applicants
-
 def get_applicant_detail(applicant_id):
     return sumsub_get(f"/resources/applicants/{applicant_id}/one")
+
+# ── Read CSV ───────────────────────────────────────────────────────────────────
+
+def load_applicants_from_csv(filepath):
+    """
+    Читает CSV из Sumsub Dashboard экспорта.
+    Берём только GREEN + completed applicants у которых есть реальное имя.
+    """
+    applicants = []
+
+    with open(filepath, encoding="utf-8") as f:
+        # Sumsub использует ; как разделитель
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            # Пропускаем не завершённых
+            if row.get("result") != "GREEN":
+                continue
+            if row.get("status") not in ("completed", "init"):
+                continue
+
+            name = row.get("applicantName", "").strip()
+            # Пропускаем applicants без имени (незавершённые)
+            if not name or name.startswith("Applicant '"):
+                continue
+
+            applicants.append({
+                "applicantId": row["applicantId"].strip('"'),
+                "name":        name.strip('"'),
+                "email":       row.get("applicantEmail", "").strip('"'),
+                "sourceKey":   row.get("sourceKey", "").strip('"'),
+            })
+
+    return applicants
 
 # ── Expiry check ───────────────────────────────────────────────────────────────
 
@@ -84,13 +99,14 @@ def parse_date(value):
     except (ValueError, TypeError):
         return None
 
-def check_expiry(applicant):
+def check_expiry(detail, csv_name):
     now      = datetime.now(tz=timezone.utc)
     deadline = now + timedelta(days=EXPIRY_WARN_DAYS)
-    info     = applicant.get("info", {})
-    first    = (info.get("firstName") or "").strip()
-    last     = (info.get("lastName") or "").strip()
-    full_name = f"{first} {last}".strip() or "—"
+
+    info      = detail.get("info", {})
+    first     = (info.get("firstName") or "").strip()
+    last      = (info.get("lastName")  or "").strip()
+    full_name = f"{first} {last}".strip() or csv_name
 
     id_docs = info.get("idDocs", [])
     worst_expiry, worst_doc = None, None
@@ -98,6 +114,9 @@ def check_expiry(applicant):
     for doc in id_docs:
         exp = parse_date(doc.get("validUntil") or doc.get("expiry"))
         if exp is None:
+            continue
+        # Пропускаем "вечные" документы (2099)
+        if exp.year >= 2099:
             continue
         if worst_expiry is None or exp < worst_expiry:
             worst_expiry, worst_doc = exp, doc
@@ -107,7 +126,7 @@ def check_expiry(applicant):
 
     days_left = (worst_expiry - now).days
     return {
-        "applicant_id": applicant.get("id"),
+        "applicant_id": detail.get("id"),
         "full_name":    full_name,
         "doc_type":     worst_doc.get("idDocType", "UNKNOWN") if worst_doc else "UNKNOWN",
         "doc_number":   worst_doc.get("number", "—") if worst_doc else "—",
@@ -216,7 +235,7 @@ def post_report(alerts, slack_users):
     expiring = sorted([a for a in alerts if not a["expired"]], key=lambda x: x["days_left"])
 
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "KYC Document Expiry Report", "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": "🛂 KYC Document Expiry Report", "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": (
             f"📅 {now_str}  |  🔴 Истекло: *{len(expired)}*  |  🟡 Скоро: *{len(expiring)}*"
         )}]},
@@ -252,22 +271,28 @@ def main():
     slack_users = get_slack_users()
     print(f"    Найдено: {len(slack_users)}")
 
-    print("2/4 Загружаем applicants из Sumsub...")
-    applicants = get_all_applicants()
-    print(f"    Найдено: {len(applicants)}")
+    print(f"2/4 Читаем CSV: {CSV_FILE}")
+    if not os.path.exists(CSV_FILE):
+        print(f"    ОШИБКА: файл {CSV_FILE} не найден!")
+        sys.exit(1)
+    applicants = load_applicants_from_csv(CSV_FILE)
+    print(f"    GREEN+completed applicants: {len(applicants)}")
 
-    print("3/4 Проверяем документы...")
+    print("3/4 Проверяем документы через Sumsub API...")
     alerts = []
-    for app in applicants:
+    for i, app in enumerate(applicants):
         try:
-            detail = get_applicant_detail(app["id"])
-            result = check_expiry(detail)
+            detail = get_applicant_detail(app["applicantId"])
+            result = check_expiry(detail, app["name"])
             if result:
                 alerts.append(result)
                 flag = "🔴" if result["expired"] else "🟡"
                 print(f"    {flag} {result['full_name']} — {result['doc_type']} — {result['expiry_date']}")
+            # Небольшая пауза чтобы не превысить rate limit
+            if i % 10 == 0:
+                time.sleep(0.5)
         except Exception as e:
-            print(f"    ⚠️  Ошибка {app.get('id')}: {e}")
+            print(f"    ⚠️  {app['name']} ({app['applicantId']}): {e}")
             continue
 
     print(f"4/4 Отправляем в #{SLACK_CHANNEL}... ({len(alerts)} записей)")
